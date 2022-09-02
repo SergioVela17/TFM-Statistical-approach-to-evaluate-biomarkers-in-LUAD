@@ -1,0 +1,942 @@
+---
+title: "Statistical approach based on survival analysis to evaluate biomarkers in the diagnosis and prognosis of lung adenocarcinoma"
+subtitle: "Master en Bioinformática, Universidad de Murcia. Curso 21/22"
+author: "Sergio Vela Moreno"
+date: "02/09/2022"
+---
+
+This file contains the code developed to perform all the analysis described in the Masters Degree Final Thesis titled "Statistical approach based on survival analysis to evaluate biomarkers in the diagnosis and prognosis of lung adenocarcinoma", carried out by Sergio Vela Moreno for the Master in Bioinformatics by the University of Murcia during the 2021/2022 academic year.
+
+The aim of this study is to explore DFS as a suitable surrogate for OS in the prognosis of lung adenocarcinoma (LUAD), through the determination of independent biomarkers which affect the evaluation of the OS and DFS of patients suffering from this type of cancer, as well as to determine which biomarkers could be used for early diagnosis.
+
+First, the working directory must be set, as well as a seed in order to ensure the obtainance of the same results.
+
+```{r}
+setwd("C:/Users/Pc/Desktop/TFM")
+
+set.seed(1234)
+```
+
+# Libraries:
+
+All the libraries used for the study are uploaded in this section.
+
+```{r}
+library(TCGAbiolinks)
+library(sesame)
+library(NOISeq)
+library(ChAMP)
+library(gprofiler2)
+library(glmnet)
+library(caret)
+library(dplyr)
+library(doParallel)
+library(survival)
+library(ggplot2)
+library(ggfortify)
+library(survminer)
+```
+
+#Data download:
+
+Data from the project **TCGA-LUAD* is downloaded, which is found in the repository The Cancer Genome Atlas (TCGA), using the package `TCGABiolinks` which is found in `Bioconductor` and can be installed using `Biomanager`.
+
+Firstly, all the "Transcriptome Profiling" files from samples labeled as Primary Tumor and Normal Solid Tissue are downloaded, which contain gene expression data from 60660 human genes. In total 596 Transcriptome Profilings are obtained, which belong to 537 different patients: 537 samples belong to tumor tissue and 59 non tumor tissue.
+
+```{r}
+### RNA-seq expression (Reference Hg38) (Library TCGABiolinks):
+
+queryRNA <- GDCquery(
+  project = "TCGA-LUAD",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  access = "open",
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "STAR - Counts",
+  sample.type = c("Primary Tumor", "Solid Tissue Normal"))
+
+GDCdownload(
+  query = queryRNA,
+  method = "api",
+  files.per.chunk = 10)
+
+dataRNA <- GDCprepare(
+  query = queryRNA,
+  save = FALSE)
+
+# saveRDS(dataRNA, file = "dataRNA.rds")
+```
+
+Afterwards, DNA methylation files are downloaded. In this case clinical data is not automatically added, so methylation data from solid normal tissue and tumor tissue are download separately and binded later in order to identify both types of samples.
+
+Methylation data from 32 non tumor samples and 473 tumor samples has been downloaded. Both types od samples contain methylation beta values corresponding to 485577 identified CpGs.
+
+```{r}
+### Methylation (Library TCGABiolinks and sesame):
+
+query_met.hg38_Illu450_Normal <- GDCquery(
+  project= "TCGA-LUAD",
+  data.category = "DNA Methylation",
+  data.type = "Methylation Beta Value",
+  platform = "Illumina Human Methylation 450",
+  sample.type = "Solid Tissue Normal")
+
+GDCdownload(query_met.hg38_Illu450_Normal)
+
+dataMet_Illu450_TCGA_Sano <- GDCprepare(
+  query_met.hg38_Illu450_Normal,
+  save = FALSE)
+
+# saveRDS(dataMet_Illu450_TCGA_Sano, file = "dataMetTCGAsano.rds")
+
+query_met.hg38_Illu450_Tumoral <- GDCquery(
+  project= "TCGA-LUAD",
+  data.category = "DNA Methylation",
+  data.type = "Methylation Beta Value",
+  platform = "Illumina Human Methylation 450",
+  sample.type = "Primary Tumor")
+
+GDCdownload(query_met.hg38_Illu450_Tumoral)
+
+dataMet_Illu450_TCGA_Tumoral <- GDCprepare(
+  query_met.hg38_Illu450_Tumoral,
+  save = FALSE)
+
+# saveRDS(dataMet_Illu450_TCGA_Tumoral, file = "dataMetTCGAtumoral.rds")
+```
+
+Additional clinical data for the same TCGA project has been downloaded from cBioPortal.
+
+```{r}
+### Clinical data from cBioportal:
+
+url <- 'http://www.cbioportal.org/webservice.do?cmd=getClinicalData&case_set_id=luad_tcga_all'
+req <- httr::GET(url)
+clinical_data_lung <- 
+    httr::content(req,
+                  type = 'text/tab-separated-values',
+                  col_names = T,
+                  col_types = NULL
+                  )
+```
+
+
+# Differential expression analysis with NOISeq: 
+
+In order to perform the differential expression analysis of genes the package `NoiSeq` has been used, which performs a non parametric analysis of gene expression between both conditions (Tumor tissue against normal tissue) using expression values normalized to FPKM.
+
+A dataframe containing each sampled identified by its ID as well as the sample type is generated.
+
+```{r}
+FactoresGeneExpressionData <- as.data.frame(dataRNA@colData$sample_type)
+
+FactoresGeneExpressionData <- cbind(FactoresGeneExpressionData,dataRNA@colData$sample)
+```
+
+Then, another dataframe is generated, which contains gene expression quantification represented as FPKM.
+
+```{r}
+FPKMGenesExpression <-  as.data.frame(dataRNA@assays@data@listData$fpkm_unstrand)
+```
+
+Once both dataframes have been generated, they are processed with the function `readData` from the packaged `NoiSeq`, which allows to identify both dataframes as the gene expression values and the factors to differentiate both kinds of samples.
+ 
+Afterwards, the differential gene expression analysis between both conditions is performed, indicating which is the dataset containing expression data and the name of the factor column that identifies samples as tumor or non tumor. 
+The parameters used to perform this analysis have been:
+
+* `norm="n"`, as gene expression has been previously normalized.
+
+* `nss=5`, in order to generate 5 replicates from each sample, as expression has been measured only once for each sample.
+
+* `pnr=0.2`, which indicated the read depth percentage used to generate each replicate from the expression values of each sample.
+ 
+* `v=0.02` indicates a slight variation to the value of `pnr`.
+
+* `replicates="no`, as there are no actual biological replicates for each condition.
+ 
+```{r}
+myGeneExpressionData <- readData(data = FPKMGenesExpression, factors = FactoresGeneExpressionData)
+
+myGeneExpressionResults <- noiseq(myGeneExpressionData, factor = "dataRNA@colData$sample_type", k = NULL, norm = "n", pnr = 0.2, nss = 5, v = 0.02, replicates = "no")
+```
+
+After performing the differetial gene expression analysis and obtaining the probability of differential expression for each gene, a cut off of `q=0.9` is used. All genes with a probability higher than this umbral value are considered differentially expressed genes between both conditions. In this case `q` is given this value as there are no replicates.
+
+```{r}
+myGeneExpressionResults.deg = degenes(myGeneExpressionResults, q = 0.9, M = NULL)
+
+myGeneExpressionResults.deg.up = degenes(myGeneExpressionResults, q = 0.9, M = "up")
+
+DEGsIndexes <- rownames(myGeneExpressionResults.deg)
+
+DEGsNames <-  dataRNA@rowRanges@elementMetadata$gene_name [DEGsIndexes]
+
+# DEGsNames <-  dataRNA@rowRanges@elementMetadata$gene_name [c(10430, 19449, 18451, 18584, 32447, 6848, 11444)]
+```
+
+As a result, 7 genes have been identified as differentially expressed, all of which have a higher expression in tumor tissue samples than in non tumor tissue sample. 
+The genes identified as differentially expressed are *FF2*, *RNY3*, *RNU5B-1*, *RNA5-8SP2*, *LINC00676*, *REG4* and *DEFA5*.
+
+# DNA methylation data analysis with ChAMP:
+
+Next, a differential methylation analysis is performed in order to identify  CG dimers in the DNA that are differentially methylated (DMPs) in tumor samples against healthy samples.
+
+For this purpose, a dataframe containing methylation beta values of all the TCGA samples is created. Rows in this dataframe represent the different CpG sites, whereas columns represent the different samples. The first 32 columns belong to samples from healthy tissue and the rest to samples from tumor tissue. Rows corresponding to CpG sites containing missing values (`NA`) are eliminated using the function `na.omit` in the package `data.table`.
+
+```{r}
+# dataMet_Illu450_TCGA_Sano <- readRDS("dataMetTCGAsano.rds")
+
+# dataMet_Illu450_TCGA_Tumoral <- readRDS("dataMetTCGAtumoral.rds")
+
+# ListadoMetSanos <- dataMet_Illu450_TCGA_Sano@colData$samples
+
+# ListadoMetTumoral <- dataMet_Illu450_TCGA_Tumoral@colData$samples
+
+ValoresBetaMetSanos <- as.data.frame(dataMet_Illu450_TCGA_Sano@assays@data@listData)
+
+ValoresBetaMetTumoral <- as.data.frame(dataMet_Illu450_TCGA_Tumoral@assays@data@listData)
+
+ValoresBetaMetTCGA <- cbind(ValoresBetaMetSanos, ValoresBetaMetTumoral)
+
+ValoresBetaMetTCGAProcesados <- na.omit(ValoresBetaMetTCGA)
+
+# ValoresBetaMetTCGAProcesados <- readRDS("valoresBetaMetProcesados.rds")
+```
+
+Once the dataframe containing methylation values has been generated, a new dataframe containing two columns is created: the nme of each sample contained in the first dataframe and the type of sample (Tumor or non tumor). This is done in order to label each sample with its corresponding condition.
+
+```{r}
+CasosMetTCGAPheno <- as.data.frame(colnames(ValoresBetaMetTCGA))
+
+CasosMetTCGAPheno  <- cbind(CasosMetTCGAPheno, "Phenotype")
+
+colnames(CasosMetTCGAPheno) <- c("Samples", "Phenotype")
+
+CasosMetTCGAPheno$Phenotype <- "Tumor"
+
+CasosMetTCGAPheno [c(1:32), 2] <- "NonTumor"
+```
+
+Afterwards, the differential methylation analysis is performed using the library `ChaMP`, which can be found in
+`Bioconductor`.
+
+Firstly it is necessary to define the type of each sample as a character vector.
+
+```{r}
+PhenotypeTCGA <- as.character(CasosMetTCGAPheno$Phenotype)
+
+PhenotypeTCGA <- make.names(PhenotypeTCGA, unique = FALSE, allow_ = TRUE)
+
+# PhenotypeTCGA <- readRDS("PhenoMet.rds")
+```
+
+Methylation values contained in the dataframe as beta values are normalizedusing the function `champ.norm`, indicating the type of array used to obtain these values (in this case 450K) and the number of cores to use if the normalization is executed in parallel (cores=5).
+
+```{r}
+myLoad <- ValoresBetaMetTCGAProcesados
+
+myImport <- ValoresBetaMetTCGAProcesados
+
+myNorm <- champ.norm(beta=ValoresBetaMetTCGAProcesados,arraytype="450K",cores=5)
+
+# myNorm <- readRDS("MetNormalized.rds")
+```
+
+Once methylation values have been normalyzed, a differential methylation analysis is performed, indicating the dataframe they are contained in, the character vector that identifies each sample type, and the array used to obtain the methylation values.
+
+```{r}
+myDMP <- champ.DMP(beta=myNorm, pheno = PhenotypeTCGA, arraytype = "450K")
+
+# myDMP <- readRDS("myDMPs.rds")
+```
+
+As a result, 150903 DMPs have been identified when comparing samples from non tumor tissue against tumor tissue.
+
+Among all the identified DMPs, only those located in *enhancer* regions have been used in downstream analysis (This is because from a biological point of view, methylation of these regions is highly related with gene expression and, from an informatic point of view, the computational cost is too high to perform later analysis with the totality of the data).
+
+```{r}
+PosMetDiferencial <- row.names(myDMP$NonTumor_to_Tumor)
+
+# CpG.GUI(CpG = PosMetDiferencial, arraytype = "450K") # La librería permite abrir una interfaz de usuario para visualizar la distribución de los sitios CpG en cromosomas y tipo de región.
+
+VectorEnhancer <- myDMP$NonTumor_to_Tumor$Enhancer
+
+PosMetDiferencialEnhancers <-  PosMetDiferencial[VectorEnhancer]
+
+PosMetDiferencialEnhancers <- na.omit(PosMetDiferencialEnhancers)
+
+PosMetDiferValoresBetaNormalizados <- myNorm [PosMetDiferencialEnhancers,]
+
+PosEnhancerMetDiferValoresBetaNormalizados <- PosMetDiferValoresBetaNormalizados[PosMetDiferencialEnhancers,]
+
+# PosEnhancerMetDiferValoresBetaNormalizados <- readRDS("EnhancerPosMetDifValoresBetaNormalizados.rds")
+```
+
+As a result, 37936 DMPs located in enhancer regions are obtained.
+
+Using the function `champ.DMR`, it is possible to identify differentially methylated regions (DMRs) between both conditions, similarly to the way used to identify DMPs. The total of DMPs are distributed in 880 DMRs.
+
+```{r}
+myDMR <- champ.DMR(beta=myNorm, pheno = CasosMetTCGAPheno$Phenotype, arraytype = "450K")
+
+# myDMR <- readRDS("myDMRs.rds")
+
+# DMR.GUI(DMR = myDMR,beta = myNorm,pheno = PhenotypeTCGA) # Existe esta función, que permite abrir una interfaz fráfica para visualizar las distintas DMRs identificadas, pudiendo a su vez comprobar visualmente las DMPs que connforman cada una de las DMRs y sus valores de metilación en ambas condiciones.
+```
+
+# Functional Enrichment Analysis of DEGs:
+
+Then, a functional enrichment analysis is performed with the list of DEGs, in order to identify biological characteristics related to those genes. This analysis has been performed using the function `gost` from the package `gprofiler2`, which uses as parameters the list of DEGs and the organism those genes belong to (in this case *Homo sapiens*). The rest of parameters have been set as default. As a result, a single *Molecular Function* associated with these DEGs has been identified, which has the ID *GO:0031723* in the database Gene Ontology, which corresponds to CXCR4 chemokine receptor binding. This receptor has been related to different types of diseases, such as many types of cancer, being responsible for directly controlling cell proliferation of non-hematopoietic cells and promoting tumor growth. The results of this analysis can be displayed using the function `gostplot`.
+
+```{r}
+# library(gprofiler2)
+
+ListaGenes <- colnames(DEGsExpressionFPKMTras)
+gostres = gost(query = ListaGenes,
+               organism = "hsapiens")
+
+head(gostres$result)
+
+gostplot(gostres, interactive = TRUE)
+```
+
+
+# Correlation analysis:
+
+## Data frames filtering and cleaning:
+
+Next, a correlation analysis is performed between selected DMPs. The dataframe containing their methylation values must be transposed ("EnhancerBetaDMPs"), so that rows contain the different samples considered and columns represent the different CpGs identified as DMP.
+
+```{r}
+EnhancerBetaDMPs <- PosEnhancerMetDiferValoresBetaNormalizados
+
+EnhancerBetaDMPs <- data.frame(t(EnhancerBetaDMPs))
+```
+
+Then a correlation analysis has been performed using the *Pearson* method by generation of the corresponding correlation matrix. Using the function `findCorrelation` from the package `caret` highly correlated DMPs have been filtered with `cutoff=0.9`.
+
+```{r}
+CorrelationMatrixDMPs1 <- cor(EnhancerBetaDMPs, method = "pearson")
+
+Correlation1 <- findCorrelation(CorrelationMatrixDMPs1,  cutoff = 0.9)
+
+# Correlation1 <- readRDS("CorrelationIndex.rds")
+```
+
+Once they have been identified, columns corresponding to highly correlated DMPs are removed.
+
+```{r}
+EnhancerBetaDMPsNoCor <- EnhancerBetaDMPs [,-Correlation1]
+```
+
+The next step is to identify tissue samples in the methylation dataframe with the same code as the one used in the genetic expression dataframe, in order to integrate both types of data, as in the first case samples are identified with an unique barcode whereas in the second case they are identified with the name of each sample. 
+Barcodes for each sample must be modified in order to match with the identified sample name, which can be done defining the function `Recortar`, that removes the last 16 characters from the barcode names, obtainig the same name structure as the one used in a methylation sample.
+
+```{r}
+BarcodesDMPs <- rownames(EnhancerBetaDMPsNoCor)
+
+Recortar <- function(nombre){
+substring(nombre, first =0, last = 16)  
+}
+
+NombresDMPsRecortados <- sapply(BarcodesDMPs,Recortar)
+
+rownames(EnhancerBetaDMPsNoCor) <- NombresDMPsRecortados
+
+IndicesNombresRepetidos <- duplicated(NombresDMPsRecortados) # Mark that 4 tissue samples are doubled represented in the methylation dataframe. Duplicated samples must be removed as each sample can only appear once.
+ 
+NombresEnhancerBetaDMPsNoDuplicados <- NombresDMPsRecortados [!IndicesNombresRepetidos]
+
+EnhancerBetaDMPsNoDuplicados <- EnhancerBetaDMPsNoCor[NombresEnhancerBetaDMPsNoDuplicados,]
+
+rownames(EnhancerBetaDMPsNoDuplicados) <- NombresEnhancerBetaDMPsNoDuplicados
+```
+
+After preparing methylation data, gene expression data are processed, obtaining expression values of genes identified as DEGs for the 596 samples included. 
+Rows and columns are renamed with the DEGs and samples names respectively.
+Finally, the transpose matrix is obtained, which represents DEGs in its columns and samples, as in the methylation dataframe, in its rows.
+
+
+```{r}
+#RNA-Seq Expression of DEGs:
+
+DEGsExpressionFPKM <- FPKMGenesExpression[DEGsIndexes,]
+rownames(DEGsExpressionFPKM) <- DEGsNames
+colnames(DEGsExpressionFPKM) <- dataRNA@colData$sample
+
+DEGsExpressionFPKMTras <- as.data.frame(t(DEGsExpressionFPKM))
+
+# DEGsExpressionFPKMTras <- readRDS("MatrizExpresiónDEGsTranspuesta.rds")
+```
+
+After making this change, both types of data are ready to be integrated into a single dataframe.
+First, those samples of the methylation data frame that are also found in the DEGs expression data frame are selected.
+The methylation data corresponding to each of the samples are then added to this new data frame.
+Finally, samples containing `NA` values are removed using the function `na.omit()`. 
+
+```{r}
+ExpresionDeMet <- DEGsExpressionFPKMTras[NombresEnhancerBetaDMPsNoDuplicados,]
+
+DatosExpresionMet <- cbind (ExpresionDeMet, EnhancerBetaDMPsNoDuplicados)
+
+DatosExpresionMet <- na.omit(DatosExpresionMet)
+```
+
+## Correlation analysis between DEGs and DMPs:
+
+Once the dataframe that integrates the DEGs expression and DMPs methylation data has been processed, a correlation analysis is carried out using the Pearson method to detect possible associations between the variables in the columns. Those variables that have been detected as highly correlated (`cutoff=0.9`) are eliminated.
+
+```{r}
+CorrelationMatrixExpresionDMPs <- cor(DatosExpresionMet, method = "pearson")
+
+Correlation2 <- findCorrelation(CorrelationMatrixExpresionDMPs,  cutoff = 0.9)
+
+DatosExpresionMetNoCor <- DatosExpresionMet[,-Correlation2]
+```
+
+Next, a new column is added to the end of the dataframe, called "Estado", which indicates whether a sample corresponds to tumor tissue or not.
+
+```{r}
+DatosExpresionMetNoCor$Estado <- "Tumor"
+
+DatosExpresionMetNoCor[(1:21), 35193] <- "NonTumor"
+```
+
+Finally, variables with variance close to zero are eliminated using the function `nearZeroVar()` from the package `caret`.
+
+```{r}
+VariablesCercanasCero <- nearZeroVar(DatosExpresionMetNoCor[,-35193])
+
+DatosExpresionMetNoCorNoNZV <- DatosExpresionMetNoCor[,-VariablesCercanasCero]
+
+# DatosExpresionMetNoCorNoNZV <- readRDS("DatosExpresionMetConEstado.rds")
+```
+
+As a result, a dataframe is obtained that contains 483 samples represented in its rows (21 of them from healthy tissue and 462 from tumor tissue) and 35191 variables represented in its columns (5 correspond to the expression of DEGs, 1 to the variable "Estado" which classifies the samples into types, and the rest into methylation values in the selected DMPs).
+
+
+# Models generation:
+
+## Tumoral state diagnosis:
+
+### Data partition
+
+Once the dataframe containing the DEGs and DMPs data identified as possible biomarkers has been obtained, a partition of the data is carried out to separate the samples into training data and test data. In order for the result of the partition to keep the same proportion of healthy and tumor samples as the original dataframe, the function `createDataPartition()` from the package `caret`. The 75% of the samples are used as training data whereas the remaing 25% are used as test data for the model.
+
+```{r}
+VariableRespuesta <- DatosExpresionMetNoCorNoNZV$Estado
+
+TrainIDs <- createDataPartition(VariableRespuesta, p = 0.75, list = FALSE)
+
+TrainData <- DatosExpresionMetNoCorNoNZV[TrainIDs,]
+
+TestData <- DatosExpresionMetNoCorNoNZV[-TrainIDs,]
+
+TrainEstado <-  TrainData$Estado
+  
+TestEstado <-   TestData$Estado
+
+TrainData <- DatosExpresionMetNoCorNoNZV[TrainIDs,-35191]
+
+TestData <- DatosExpresionMetNoCorNoNZV[-TrainIDs,-35191]
+```
+
+### Model fitting:
+
+After partitioning the data, a logistic regression model is adjusted to identify the best predictors that can explain the classification of the samples according to the response variable "Estado".
+
+For this, use of the function `cv.glmnet()`in the package `glmnet` is made, where the predictor variables of the training data, the response variable (Estado) of said data, the type of distribution to be obtained (in this case binomial since the samples are classified as tumor or healthy) and the hyperparameter `alpha`, which indicate *ElasticNet mixing parameter* and ranges bewteen 0 and 1, are used. 
+
+```{r}
+# library(glmnet)
+
+TrainDataMatrix <- as.matrix(TrainData)
+
+Modelo1 <- cv.glmnet(
+  x=TrainDataMatrix,
+  y=TrainEstado,
+  alpha=0.5,
+  family="binomial"
+)
+```
+
+The generated model is used to predict the status of the test cases from their predictor variables using the function `predict()` from the package `stats`.
+
+```{r}
+TestDataMatrix <- as.matrix(TestData)
+
+PredEstado <- predict(Modelo1, newx = TestDataMatrix, type = "class", s = "lambda.min")
+```
+
+The results of the prediction, together with the object that contains the state variable of the cases used as test, are used to generate a confusion matrix. It can be seen that the state determined by the predictions made with the generated model coincide with the original state in all the cases studied.
+
+```{r}
+TestEstadoMatrix <- as.matrix(TestEstado)
+
+MatrizConfusion <- table(PredEstado, TestEstadoMatrix)
+
+print(MatrizConfusion)
+
+print(paste0("Sensitivity: ", sensitivity(MatrizConfusion)))
+
+print(paste0("Specificity: ", specificity(MatrizConfusion)))
+
+print(paste0("Precision: ", precision(MatrizConfusion)))
+```
+
+
+### Getting variables that contribute to state prediction:
+
+Next, all those predictor variables that have been used to generate the diagnosis model are selected. To do this, from among the 35190 predictor variables, all those that in the model have a coefficient other than 0 are selected. Note that the first variable of the model is the intercept that, since it is not part of the dataframe of predictors, is eliminated. In total, 47 predictors that allow differentiating the state in each case are obtained, all of them being differentially methylated CpG sites.
+
+```{r}
+res_variables <- coef(Modelo1, s = "lambda.min")
+
+dim(res_variables)
+
+res_variables <- res_variables[res_variables [,1] !=0,]
+
+res_variables <- res_variables[-1]
+
+relevant_variables <- names(res_variables)
+
+relevant_variables
+```
+
+The identified DMPs along with their respective coefficients in the model have been saved in a table.
+
+```{r}
+TablaVariablesDiagnóstico <-as.data.frame(res_variables)
+
+TablaVariablesDiagnóstico
+```
+
+Through the use of the graphical interface for visualization of CpGs in the package `ChaMP` the distribution of the 47 DMPs identified as possible biomarkers for the diagnosis of tumor or non-tumor status in patients with lung adenocarcinoma can be verified.
+It can be seen that most of these DMPs are found on chromosomes 2, 1, 10 and 4, and that within them they mainly belong to gene-type and intergenic-type regions.
+
+```{r}
+# CpG.GUI(relevant_variables, arraytype = "450K")
+```
+
+Next, an analysis of the type *Overall Survival* and another of the type *Disease free survival (DFS)* are performed to study possible relationships between predictors and survival time and disease-free status, respectively, in patients who suffer from this type of cancer.
+
+## Overal Survival and Disease Free Survival analysis:
+
+In the first place, clinical data must be obtained from all those patients for whom information is available on time and disease-free status and survival. For this, the clinical data associated with this same project (TCGA-LUAD (2014)) that can be found in the repository `cBioportal` are used. The reason for using these data additionally is because the clinical data originally obtained from `TCGA` are incomplete and do not present information about disease-free time in patients.
+
+```{r}
+### Clinical data from cBioportal:
+
+url <- 'http://www.cbioportal.org/webservice.do?cmd=getClinicalData&case_set_id=luad_tcga_all'
+req <- httr::GET(url)
+clinical_data_lung <- 
+    httr::content(req,
+                  type = 'text/tab-separated-values',
+                  col_names = T,
+                  col_types = NULL
+                  )
+```
+
+As a result, clinical data corresponding to 586 tumor samples affected by lung adenocarcinoma are obtained. This data is transformed, changing the column names to lowercase to avoid potential problems and replacing all missing values with `NA`.
+
+```{r}
+## names to lower case
+names(clinical_data_lung) <- tolower(names(clinical_data_lung))
+
+## convert empty strings -> NA values
+convert_blank_to_na <- function(x) {
+    if (!purrr::is_character(x)) {
+        warning('input vector is not character - returning original input')
+        return(x)
+    } else {
+        ifelse(x == '', NA, x)
+    }
+}
+
+clinical_data <- clinical_data_lung %>%
+    dplyr::mutate_each(funs =  funs(convert_blank_to_na), everything())
+```
+
+### Data cleaning and filtering:
+
+After the data has been downloaded and prepared, a filter is carried out to eliminate those cases in which there is no information about the status, total survival time (OS) and/or disease-free time (DFS).
+
+```{r}
+clinical_data %>%
+    dplyr::filter(is.na(dfs_status) | dfs_status == '') %>%
+    dplyr::select(dfs_status, dfs_months) %>%
+    str()
+
+clinical_data_Survival <- 
+    clinical_data %>%
+    dplyr::filter(!is.na(dfs_status) & dfs_status != '') %>%
+    dplyr::filter(dfs_months >= 0 & !is.na(dfs_months))
+
+clinical_data_Survival %>%
+    dplyr::filter(is.na(os_status) | os_status == '') %>%
+    dplyr::select(os_status, os_months) %>%
+    str()
+```
+
+Once the clinical information of all those cases of patients for whom said data is known has been obtained, it is checked whether there are cases with a disease-free time equal to 0 and the status of said patients is analyzed if so.
+
+```{r}
+clinical_data_Survival %>%
+    dplyr::filter(!is.na(dfs_status) & dfs_status != '') %>%
+    dplyr::filter(dfs_months <= 0 | is.na(dfs_months)) %>%
+    dplyr::select(dfs_status, dfs_months) %>%
+    head()
+```
+
+As can be seen, there are three cases of patients with time equal to 0, whose status is free of disease. This means that they are tumor samples from patients who have very recently received a favorable diagnosis for disease-free status, so the information related to these cases should not be included in the DFS-type analysis since there is no information about them. of a possible change of state over time.
+
+```{r}
+clinical_data_Survival <- 
+    clinical_data_Survival %>%
+    dplyr::filter(!is.na(dfs_status) & dfs_status != '') %>%
+    dplyr::filter(dfs_months > 0 & !is.na(dfs_months))
+```
+
+In the same way, it is checked if there are cases with a survival time equal to 0 and the status of these patients is analyzed in the affirmative case. In this case, patients with a survival time of 0 are not obtained.
+
+```{r}
+clinical_data_Survival %>%
+    dplyr::filter(!is.na(os_status) & os_status != '') %>%
+    dplyr::filter(os_months <= 0 | is.na(os_months)) %>%
+    dplyr::select(os_status, os_months) %>%
+    head()
+```
+
+In total, there are 436 cases of lung adenocarcinoma patients for whom information is available on the state and time of OS and DFS.
+
+### OS Event-time distribution:
+
+The distribution of patients who have survived or died from this disease can be represented by the package `ggplot2`.
+
+```{r}
+ggplot(clinical_data_Survival,
+       aes(x = os_months,
+           group = os_status,
+           colour = os_status,
+           fill = os_status
+           )) + 
+    geom_density(alpha = 0.5)+
+  labs(title = "Event-time distribution of OS")
+```
+
+###  Kaplan-Meier analysis:
+
+Once the times and survival status have been obtained, it is possible to use both as dependent variables to use the Kaplan-Meier method, which allows a first estimate to be made that relates the proportion of deceased patients with respect to time using the function `survfit()` from the package `survival`. In this way, it can be seen how after a threshold close to 72 months of illness, the proportion of deaths from this type of cancer exceeds the number of patients who survive.
+
+```{r}
+EstadoOS <- clinical_data_Survival$os_status
+
+EstadoOS <- as.factor(EstadoOS)
+
+TiempoOS <- clinical_data_Survival$os_months
+
+GrupoTratamiento <- clinical_data_Survival$targeted_molecular_therapy
+
+GrupoTratamiento <- as.factor(GrupoTratamiento)
+```
+
+```{r}
+KM.surv.OS <- 
+    survfit(
+        Surv(os_months,EstadoOS) ~ 1,
+        data = clinical_data_Survival%>%
+            dplyr::mutate(os_deceased = os_status == '1:DECEASED')
+    )
+
+KM.surv.OS$states[1] <- '0:LIVING'
+
+summary(KM.surv.OS)
+
+ggplot2::autoplot(KM.surv.OS, conf.int = F) +
+    ggtitle('Kaplan-Meier OS curve against time for LUAD')
+```
+
+If an independent variable is selected, this type of model also allows relating the proportion of deaths with respect to time grouped based on the independent variable, such as the age of the patients studied.
+
+```{r}
+SurvivalEdadPorGrupos <- mutate(clinical_data_Survival, age = ifelse((age<60), "<60",">60"),
+                        age = as.factor(age),
+                        targeted_molecular_therapy = as.factor(targeted_molecular_therapy))
+
+KMOSAge <- survfit(Surv(TiempoOS, EstadoOS) ~ SurvivalEdadPorGrupos$age, data = SurvivalEdadPorGrupos)
+
+KMOSAge$states[1] <- '0:LIVING'
+
+KMOSAge
+
+autoplot(KMOSAge)
+```
+
+Similarly, patients can be grouped based on whether or not they have received molecularly targeted therapy. 
+
+```{r}
+KMOSTreatment <- survfit(Surv(TiempoOS, EstadoOS) ~ SurvivalEdadPorGrupos$targeted_molecular_therapy)
+
+KMOSTreatment$states[1] <- '0:LIVING'
+
+KMOSTreatment
+
+autoplot(KMOSTreatment)
+```
+
+### Cox proportional hazards model generation:
+
+Next, a `Cox proportional hazards model` is generated, which is frequently used to relate predictor variables with survival time.
+In the first place, the filtered data of expression of DEGs and methylation of DMPs that correspond only to the samples classified as tumors of each patient must be selected.
+
+```{r}
+TumoralDatosExpresionMetNoCorNoNZV <- DatosExpresionMetNoCorNoNZV [-c(1:21),]
+```
+
+As the name of the rows of said dataframe and that of the clinical dataframe do not correspond, it is necessary to rename the cases in the clinical dataframe with the name of the respective samples. Also, since the names of the samples do not coincide exactly, it is necessary to modify them so that they are identified by codes of the same structure. Therefore, the function `Recortar2` is defined.
+
+```{r}
+rownames(clinical_data_Survival) <- clinical_data_Survival$case_id
+```
+```{r}
+Recortar2 <- function(nombre){
+substring(nombre, first =0, last = 15)  
+}
+
+TumoralNombresMuestras <- row.names(TumoralDatosExpresionMetNoCorNoNZV)
+
+NombresMuestrasTumoralesRecortados <- sapply(TumoralNombresMuestras,Recortar2)
+
+rownames(TumoralDatosExpresionMetNoCorNoNZV) <- NombresMuestrasTumoralesRecortados
+
+IndicesNombresRepetidosTumoral <- duplicated(NombresMuestrasTumoralesRecortados)
+
+NombresMuestrasTumoralesNoDuplicados <- NombresMuestrasTumoralesRecortados [!IndicesNombresRepetidosTumoral]
+
+TumoralDatosExpresionMetNoCorNoNZVNoDup <- TumoralDatosExpresionMetNoCorNoNZV[NombresMuestrasTumoralesNoDuplicados,]
+
+NombresMuestrasTumoralesNoDuplicados <- gsub("." ,"-",NombresMuestrasTumoralesNoDuplicados, fixed=TRUE)
+
+rownames(TumoralDatosExpresionMetNoCorNoNZVNoDup) <- NombresMuestrasTumoralesNoDuplicados
+```
+
+Once the rows that identify the cases have been modified, all those patients included in both dataframes are selected.
+
+```{r}
+NombresClinicalSurvival <- row.names(clinical_data_Survival)
+
+DatosDEGsDMPsSurvival <- TumoralDatosExpresionMetNoCorNoNZVNoDup[NombresClinicalSurvival,-35191] #Se elimina la variable Estado ya que todas las muestras estudiadas son tumorales
+
+DatosDEGsDMPsSurvival <- cbind(DatosDEGsDMPsSurvival, clinical_data_Survival[, c("age","dfs_months","dfs_status", "os_months", "os_status", "targeted_molecular_therapy")])
+
+DatosDEGsDMPsSurvival <- na.omit(DatosDEGsDMPsSurvival) #Se eliminan las filas de pacientes que no se encuentran en ambos data frames originales se eliminarían con na.omit(). Destacar que también se eliminarán las filas de todos aquellos pacientes para los que no existen datos de edad ni de tratamiento molecular específico.
+
+# saveRDS (DatosDEGsDMPsSurvival, file = "DatosDEGsDMPsSurvival.rds")
+```
+
+After having integrated the clinical data with the data from the DEGs and the DMPs, a dataframe is obtained that contains 132 rows, each one corresponding to a case of lung adenocarcinoma, and 35,196 columns, of which 6 correspond to clinical data. (including disease-free and overall survival time and status),5 to expression of DEGs, and the rest to methylation values in the selected DMPs.
+Next, a partition of the data is carried out to divide the resulting cases into training data and test data.
+
+```{r}
+VariableRespuestaOS <- DatosDEGsDMPsSurvival$os_status
+
+TrainIDsOS <- createDataPartition(VariableRespuestaOS, p = 0.75, list = FALSE)
+
+TrainDataOS <- DatosDEGsDMPsSurvival[TrainIDsOS,]
+
+TestDataOS <- DatosDEGsDMPsSurvival[-TrainIDsOS,]
+
+TrainDataOSTiempoEstado <-  TrainDataOS[,c("os_months","os_status")]
+  
+TestDataOSTiempoEstado <-   TestDataOS[,c("os_months","os_status")]
+
+TrainDataOS <- DatosDEGsDMPsSurvival[TrainIDsOS,-c(35192:35195)]
+
+TestDataOS <- DatosDEGsDMPsSurvival[-TrainIDsOS,-c(35192:35195)]
+```
+
+After partitioning the data, a Cox proportional hazards model is adjusted to identify the best predictors that can explain the overall survival time and whether the patient dies of cancer in a given case.
+
+For this, use of the function `glmnet()` in the package `glmnet` is made, where the predictor variables of the training data, the response variable (composed of the time and OS status of each patient) and the parameter `family="cox"` are introduced, since the type of model to be generated is a proportional hazards model to determine which are the predictors that affect survival in this cancer.
+
+```{r}
+# library(glmnet)
+
+x_OS <- data.matrix(TrainDataOS)
+
+y_OS <- data.matrix(TrainDataOSTiempoEstado)
+
+colnames(y_OS) <- c("time", "status")
+
+ModeloOS <- glmnet(x_OS, y_OS, family = "cox")
+```
+
+### Getting variables that contribute to OS prediction:
+
+Next, all those predictor variables that have been used to obtain this model are selected. For this, from among the 35192 predictor variables, all those that in the model have a coefficient other than 0 are selected. In total, 97 predictors are obtained that allow determining the state and survival time in each case, all of them being CpG sites. differentially methylated.
+
+
+```{r}
+res_variablesOS <- coef(ModeloOS, s = 0.05)
+
+dim(res_variablesOS)
+
+res_variablesOS <- res_variablesOS[res_variablesOS [,1] !=0,]
+
+relevant_variablesOS <- names(res_variablesOS)
+
+#CpG.GUI(relevant_variablesOS)
+```
+
+The covariates that this model has detected as representative can be used to generate a new data frame with fewer columns, which can be processed using the function `coxph()` from the package `survival` to carry out the generation of the model using this package. Generating the model using this library is advantageous since it allows to easily obtain statistics from it. The model generated by this method has a concordance of 0.512, that is, it is only effective in determining the time and survival status of a patient in 51.2% of cases.
+
+```{r}
+VariablesIndependientesCoxModel_OS <-  TrainDataOS[,relevant_variablesOS]
+
+VariablesIndependientesCoxModel_OS <- data.matrix(VariablesIndependientesCoxModel_OS)
+
+cox.modelOS <- coxph(Surv(y_OS)~VariablesIndependientesCoxModel_OS, ties = "breslow")
+
+summary(cox.modelOS)
+```
+
+### DFS Event-time distribution:
+
+As with the `OS` analysis, the distribution of disease-free patients with respect to time can be represented by the package `ggplot2`.
+
+```{r}
+ggplot(clinical_data_Survival,
+       aes(x = dfs_months,
+           group = dfs_status,
+           colour = dfs_status,
+           fill = dfs_status
+           )) + 
+    geom_density(alpha = 0.5)+
+  labs(title = "Event-time distribution of DFS")
+```
+
+###  Kaplan-Meier analysis:
+
+Once the times and disease-free status have been obtained, it is possible to use both as dependent variables using the Kaplan-Meier method, which allows a first estimate to be made that relates the probability of recurrence with respect to time. Again the function is used `survfit()` from the package `survival`.
+
+```{r}
+EstadoDFS <- clinical_data_Survival$dfs_status
+
+EstadoDFS <- as.factor(EstadoDFS)
+
+TiempoDFS <- clinical_data_Survival$dfs_months
+
+GrupoTratamiento <- clinical_data_Survival$targeted_molecular_therapy
+
+GrupoTratamiento <- as.factor(GrupoTratamiento)
+```
+
+```{r}
+KM.surv.DFS <- 
+    survfit(
+        Surv(dfs_months,EstadoDFS) ~ 1,
+        data = clinical_data_Survival%>%
+            dplyr::mutate(dfs_recurred = dfs_status == '1:Recurred/Progressed')
+    )
+
+KM.surv.DFS$states[1] <- '0:DiseaseFree'
+
+ggplot2::autoplot(KM.surv.DFS, conf.int = F) +
+    ggtitle('Kaplan-Meier DFS curve against time for LUAD')
+```
+
+Patients can be grouped into two groups according to whether their age is over or under 60 years of age and age can be used as an independent variable for the Kaplan-Meier method.
+
+```{r}
+SurvivalEdadPorGrupos <- mutate(clinical_data_Survival, age = ifelse((age<60), "<60",">60"),
+                        age = as.factor(age),
+                        targeted_molecular_therapy = as.factor(targeted_molecular_therapy))
+
+KMDFSAge <- survfit(Surv(TiempoDFS, EstadoDFS) ~ SurvivalEdadPorGrupos$age)
+
+KMDFSAge$states[1] <- '0:DiseaseFree'
+
+KMDFSAge
+
+autoplot(KMDFSAge)
+```
+
+Similarly, patients can be grouped based on whether or not they have received molecularly targeted therapy.
+
+```{r}
+KMDFSTreatment <- survfit(Surv(TiempoDFS, EstadoDFS) ~ SurvivalEdadPorGrupos$targeted_molecular_therapy)
+
+KMDFSTreatment$states[1] <- '0:DiseaseFree'
+
+KMDFSTreatment
+
+autoplot(KMDFSTreatment)
+```
+
+
+### Cox proportional hazards model generation:
+
+Next, another `Cox proportional hazards model` is generated, to relate in this case the predictor variables with the DFS time.
+
+As the expression, methylation and clinical data have already been integrated previously, a data partition is performed to divide the resulting cases into training data and test data according to their times and survival status.
+
+```{r}
+VariableRespuestaDFS <- DatosDEGsDMPsSurvival$dfs_status
+
+TrainIDsDFS <- createDataPartition(VariableRespuestaDFS, p = 0.75, list = FALSE)
+
+TrainDataDFS <- DatosDEGsDMPsSurvival[TrainIDsDFS,]
+
+TestDataDFS <- DatosDEGsDMPsSurvival[-TrainIDsDFS,]
+
+TrainDataDFSTiempoEstado <-  TrainDataDFS[,c("dfs_months","dfs_status")]
+  
+TestDataDFSTiempoEstado <-   TestDataDFS[,c("dfs_months","dfs_status")]
+
+TrainDataDFS <- DatosDEGsDMPsSurvival[TrainIDsDFS,-c(35192:35195)]
+
+TestDataDFS <- DatosDEGsDMPsSurvival[-TrainIDsDFS,-c(35192:35195)]
+```
+
+After partitioning the data, a Cox proportional hazards model is adjusted to identify the best predictors that can explain the time of DFS and whether cancer recurrence is possible in an existing case.
+For this, use is made of the function `glmnet()` in the package `glmnet`, where the predictor variables of the training data, the response variable (composed of the time and the DFS status of each patient) and the hyperparameter are introduced as arguments `family="cox"`, since the type of model to be generated is a proportional hazards model to determine which are the predictors that affect recurrence in this cancer.
+
+```{r}
+# library(glmnet)
+
+x_DFS <- data.matrix(TrainDataDFS)
+
+y_DFS <- data.matrix(TrainDataDFSTiempoEstado)
+
+colnames(y_DFS) <- c("time", "status")
+
+ModeloDFS <- glmnet(x_DFS, y_DFS, family = "cox")
+```
+
+### Getting variables that contribute to DFS prediction:
+
+Next, all those predictor variables that have been used to obtain this model are selected. For this, from among the 35,192 predictor variables, all those that in the model have a coefficient other than 0 are selected. In total, 94 predictors are obtained that allow determining the state and survival time in each case, all of them being CpG sites. differentially methylated.
+
+```{r}
+res_variablesDFS <- coef(ModeloDFS, s = 0.05)
+
+dim(res_variablesDFS)
+
+res_variablesDFS <- res_variablesDFS[res_variablesDFS [,1] !=0,]
+
+relevant_variablesDFS <- names(res_variablesDFS)
+
+# CpG.GUI(relevant_variablesDFS)
+```
+
+The covariates that this model has detected as representative can be used to generate a new data frame with fewer columns, which can be processed using the function `coxph()` of the library `survival` to carry out the generation of the model. through this package. Generating the model using this library is advantageous since it allows you to easily obtain statistics from it. The model generated by this method has a concordance of 0.574, that is, it is only effective in determining the time and disease-free status of a patient in 57.4% of cases.  
+
+```{r}
+CoxRegressionModelPredictors <-  TrainDataDFS[,relevant_variablesDFS]
+
+CoxRegressionModelPredictors <- data.matrix(CoxRegressionModelPredictors)
+
+cox.modelDFS <- coxph(Surv(y_DFS)~CoxRegressionModelPredictors, ties = "breslow")
+
+summary(cox.modelDFS)
+```
